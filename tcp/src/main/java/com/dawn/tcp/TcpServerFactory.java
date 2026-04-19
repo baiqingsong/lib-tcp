@@ -13,11 +13,16 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -31,10 +36,16 @@ public class TcpServerFactory {
     private static final int DEFAULT_MAX_CLIENTS = 50;
     /** 客户端 Socket 读超时（毫秒），用于检测死连接，0表示无限等待 */
     private static final int DEFAULT_CLIENT_SO_TIMEOUT = 5 * 60 * 1000;
+    /** 心跳请求标识 */
+    static final String HEARTBEAT_PING = "##HB##";
+    /** 心跳响应标识 */
+    static final String HEARTBEAT_PONG = "##HB_ACK##";
 
     private int serverPort = 8088;
     private int maxClients = DEFAULT_MAX_CLIENTS;
     private int clientSoTimeout = DEFAULT_CLIENT_SO_TIMEOUT;
+    private long heartbeatInterval = 0;
+    private long heartbeatTimeout = 0;
 
     private volatile ServerSocket serverSocket;
     private volatile TcpServerListener listener;
@@ -46,6 +57,7 @@ public class TcpServerFactory {
     private final AtomicInteger sessionId = new AtomicInteger(0);
     private volatile ExecutorService acceptExecutor;
     private volatile ExecutorService clientExecutor;
+    private volatile ScheduledExecutorService heartbeatScheduler;
 
     public TcpServerFactory() {
     }
@@ -76,6 +88,30 @@ public class TcpServerFactory {
             throw new IllegalArgumentException("Client SO timeout cannot be negative");
         }
         this.clientSoTimeout = timeoutMs;
+        return this;
+    }
+
+    /**
+     * 设置心跳参数，用于快速检测死连接并自动踢掉无响应客户端。
+     * 心跳通过内部协议自动处理，对业务层透明（不会触发 onReceiveData）。
+     *
+     * @param intervalMs 心跳检查间隔（毫秒），0 表示禁用心跳
+     * @param timeoutMs  心跳超时（毫秒），超过此时间未收到任何数据则踢掉客户端
+     * @return this
+     */
+    public TcpServerFactory setHeartbeat(long intervalMs, long timeoutMs) {
+        checkNotRunning();
+        if (intervalMs < 0) {
+            throw new IllegalArgumentException("Heartbeat interval cannot be negative");
+        }
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Heartbeat timeout cannot be negative");
+        }
+        if (intervalMs > 0 && timeoutMs <= intervalMs) {
+            throw new IllegalArgumentException("Heartbeat timeout must be greater than interval");
+        }
+        this.heartbeatInterval = intervalMs;
+        this.heartbeatTimeout = timeoutMs;
         return this;
     }
 
@@ -116,6 +152,7 @@ public class TcpServerFactory {
         if (!isRunning.compareAndSet(true, false)) {
             return;
         }
+        stopServerHeartbeat();
         ServerSocket ss = this.serverSocket;
         if (ss != null) {
             try {
@@ -211,10 +248,33 @@ public class TcpServerFactory {
     }
 
     /**
-     * 获取当前连接的客户端数量
+     * 获得当前连接的客户端数量
      */
     public int getClientCount() {
         return clientMap.size();
+    }
+
+    /**
+     * 获取所有已连接客户端的 ID 集合
+     *
+     * @return 不可修改的客户端 ID 集合
+     */
+    public Set<String> getConnectedClientIds() {
+        return Collections.unmodifiableSet(new HashSet<>(clientMap.keySet()));
+    }
+
+    /**
+     * 获取指定客户端的远程地址
+     *
+     * @param clientId 客户端ID
+     * @return 远程地址字符串（如 "/192.168.1.100:54321"），客户端不存在则返回 null
+     */
+    public String getClientAddress(String clientId) {
+        ClientConnection conn = clientMap.get(clientId);
+        if (conn != null && !conn.socket.isClosed()) {
+            return conn.socket.getRemoteSocketAddress().toString();
+        }
+        return null;
     }
 
     /**
@@ -240,6 +300,7 @@ public class TcpServerFactory {
             }
             serverStarted.set(true);
             notifyServerStarted(serverPort);
+            startServerHeartbeat();
 
             while (isRunning.get() && sessionId.get() == session) {
                 Socket clientSocket = ss.accept();
@@ -284,6 +345,7 @@ public class TcpServerFactory {
             }
         } catch (IOException e) {
             if (sessionId.get() == session && isRunning.compareAndSet(true, false)) {
+                stopServerHeartbeat();
                 Log.e(TAG, "Accept loop error", e);
                 notifyError("Server error: " + e.getMessage());
                 for (Map.Entry<String, ClientConnection> entry : clientMap.entrySet()) {
@@ -337,7 +399,12 @@ public class TcpServerFactory {
                         if (line.endsWith("\r")) {
                             line = line.substring(0, line.length() - 1);
                         }
-                        notifyReceiveData(conn.clientId, line);
+                        conn.lastActivityTime = System.currentTimeMillis();
+                        if (HEARTBEAT_PING.equals(line)) {
+                            conn.send(HEARTBEAT_PONG);
+                        } else if (!HEARTBEAT_PONG.equals(line)) {
+                            notifyReceiveData(conn.clientId, line);
+                        }
                         lineBuilder.setLength(0);
                     } else {
                         if (lineBuilder.length() < MAX_LINE_LENGTH) {
@@ -372,6 +439,40 @@ public class TcpServerFactory {
         this.acceptExecutor = null;
     }
 
+    // ==================== 心跳机制 ====================
+
+    private void startServerHeartbeat() {
+        if (heartbeatInterval <= 0) {
+            return;
+        }
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        this.heartbeatScheduler = scheduler;
+        scheduler.scheduleWithFixedDelay(() -> {
+            if (!isRunning.get()) {
+                return;
+            }
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, ClientConnection> entry : clientMap.entrySet()) {
+                ClientConnection conn = entry.getValue();
+                long elapsed = now - conn.lastActivityTime;
+                if (heartbeatTimeout > 0 && elapsed > heartbeatTimeout) {
+                    Log.w(TAG, "Client " + conn.clientId + " heartbeat timeout (" + elapsed + "ms)");
+                    disconnectClient(conn.clientId);
+                } else if (elapsed > heartbeatInterval) {
+                    conn.send(HEARTBEAT_PING);
+                }
+            }
+        }, heartbeatInterval, heartbeatInterval, TimeUnit.MILLISECONDS);
+    }
+
+    private void stopServerHeartbeat() {
+        ScheduledExecutorService scheduler = this.heartbeatScheduler;
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdownNow();
+        }
+        this.heartbeatScheduler = null;
+    }
+
     // ==================== 客户端连接封装 ====================
 
     private static class ClientConnection {
@@ -379,10 +480,12 @@ public class TcpServerFactory {
         final Socket socket;
         private volatile PrintWriter output;
         private final Object sendLock = new Object();
+        volatile long lastActivityTime;
 
         ClientConnection(String clientId, Socket socket) {
             this.clientId = clientId;
             this.socket = socket;
+            this.lastActivityTime = System.currentTimeMillis();
             try {
                 this.output = new PrintWriter(
                         new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);

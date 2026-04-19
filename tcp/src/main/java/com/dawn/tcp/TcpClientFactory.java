@@ -16,6 +16,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -33,6 +35,10 @@ public class TcpClientFactory {
     private static final long DEFAULT_RECONNECT_INTERVAL = 3_000;
     /** 默认最大重连次数，0表示不重连 */
     private static final int DEFAULT_MAX_RECONNECT_COUNT = 0;
+    /** 心跳请求标识 */
+    static final String HEARTBEAT_PING = "##HB##";
+    /** 心跳响应标识 */
+    static final String HEARTBEAT_PONG = "##HB_ACK##";
 
     private String serverIp = "127.0.0.1";
     private int serverPort = 8088;
@@ -40,6 +46,8 @@ public class TcpClientFactory {
     private int soTimeout = DEFAULT_SO_TIMEOUT;
     private long reconnectInterval = DEFAULT_RECONNECT_INTERVAL;
     private int maxReconnectCount = DEFAULT_MAX_RECONNECT_COUNT;
+    private long heartbeatInterval = 0;
+    private long heartbeatTimeout = 0;
 
     private volatile Socket socket;
     private volatile PrintWriter output;
@@ -50,6 +58,8 @@ public class TcpClientFactory {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private volatile ExecutorService connectExecutor;
     private volatile ExecutorService sendExecutor;
+    private volatile ScheduledExecutorService heartbeatScheduler;
+    private volatile long lastDataReceivedTime = 0;
 
     public TcpClientFactory() {
     }
@@ -94,14 +104,38 @@ public class TcpClientFactory {
 
     public TcpClientFactory setReconnect(int maxCount, long intervalMs) {
         checkNotRunning();
-        if (maxCount < 0) {
-            throw new IllegalArgumentException("Max reconnect count cannot be negative");
+        if (maxCount < -1) {
+            throw new IllegalArgumentException("Max reconnect count must be >= -1 (-1 for infinite)");
         }
         if (intervalMs < 0) {
             throw new IllegalArgumentException("Reconnect interval cannot be negative");
         }
         this.maxReconnectCount = maxCount;
         this.reconnectInterval = intervalMs;
+        return this;
+    }
+
+    /**
+     * 设置心跳参数，用于快速检测死连接。
+     * 心跳通过内部协议自动处理，对业务层透明（不会触发 onReceiveData）。
+     *
+     * @param intervalMs 心跳发送间隔（毫秒），0 表示禁用心跳
+     * @param timeoutMs  心跳超时（毫秒），超过此时间未收到任何数据则认为连接已死
+     * @return this
+     */
+    public TcpClientFactory setHeartbeat(long intervalMs, long timeoutMs) {
+        checkNotRunning();
+        if (intervalMs < 0) {
+            throw new IllegalArgumentException("Heartbeat interval cannot be negative");
+        }
+        if (timeoutMs < 0) {
+            throw new IllegalArgumentException("Heartbeat timeout cannot be negative");
+        }
+        if (intervalMs > 0 && timeoutMs <= intervalMs) {
+            throw new IllegalArgumentException("Heartbeat timeout must be greater than interval");
+        }
+        this.heartbeatInterval = intervalMs;
+        this.heartbeatTimeout = timeoutMs;
         return this;
     }
 
@@ -141,6 +175,7 @@ public class TcpClientFactory {
         if (!isRunning.compareAndSet(true, false)) {
             return;
         }
+        stopHeartbeat();
         closeConnection();
         shutdownExecutors();
         if (wasConnected.compareAndSet(true, false)) {
@@ -223,6 +258,7 @@ public class TcpClientFactory {
                 }
                 wasConnected.set(true);
                 notifyConnected();
+                startHeartbeat();
                 readMessages(currentSocket, session);
             } catch (IOException e) {
                 Log.e(TAG, "Connection error", e);
@@ -230,6 +266,7 @@ public class TcpClientFactory {
                     notifyError("Connection error: " + e.getMessage());
                 }
             } finally {
+                stopHeartbeat();
                 if (currentOutput != null) {
                     currentOutput.close();
                     if (this.output == currentOutput) {
@@ -259,21 +296,22 @@ public class TcpClientFactory {
             if (!isRunning.get()) {
                 break;
             }
-            if (maxReconnectCount <= 0) {
+            if (maxReconnectCount == 0) {
                 if (sessionId.get() == session && isRunning.compareAndSet(true, false)) {
                     notifyStopped();
                 }
                 break;
             }
             reconnectCount++;
-            if (reconnectCount > maxReconnectCount) {
+            if (maxReconnectCount > 0 && reconnectCount > maxReconnectCount) {
                 if (sessionId.get() == session && isRunning.compareAndSet(true, false)) {
                     notifyError("Max reconnect attempts reached (" + maxReconnectCount + ")");
                     notifyStopped();
                 }
                 break;
             }
-            Log.i(TAG, "Reconnecting in " + reconnectInterval + "ms (attempt " + reconnectCount + "/" + maxReconnectCount + ")");
+            Log.i(TAG, "Reconnecting in " + reconnectInterval + "ms (attempt " + reconnectCount
+                    + (maxReconnectCount > 0 ? "/" + maxReconnectCount : "/\u221e") + ")");
             try {
                 Thread.sleep(reconnectInterval);
             } catch (InterruptedException ie) {
@@ -339,7 +377,12 @@ public class TcpClientFactory {
                     if (line.endsWith("\r")) {
                         line = line.substring(0, line.length() - 1);
                     }
-                    notifyReceiveData(line);
+                    lastDataReceivedTime = System.currentTimeMillis();
+                    if (HEARTBEAT_PING.equals(line)) {
+                        sendHeartbeat(HEARTBEAT_PONG);
+                    } else if (!HEARTBEAT_PONG.equals(line)) {
+                        notifyReceiveData(line);
+                    }
                     lineBuilder.setLength(0);
                 } else {
                     if (lineBuilder.length() < MAX_LINE_LENGTH) {
@@ -379,6 +422,45 @@ public class TcpClientFactory {
             ce.shutdownNow();
         }
         this.connectExecutor = null;
+    }
+
+    // ==================== 心跳机制 ====================
+
+    private void startHeartbeat() {
+        if (heartbeatInterval <= 0) {
+            return;
+        }
+        lastDataReceivedTime = System.currentTimeMillis();
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        this.heartbeatScheduler = scheduler;
+        scheduler.scheduleWithFixedDelay(() -> {
+            if (!isRunning.get()) {
+                return;
+            }
+            sendHeartbeat(HEARTBEAT_PING);
+            if (heartbeatTimeout > 0) {
+                long elapsed = System.currentTimeMillis() - lastDataReceivedTime;
+                if (elapsed > heartbeatTimeout) {
+                    Log.w(TAG, "Heartbeat timeout (" + elapsed + "ms), closing connection");
+                    closeConnection();
+                }
+            }
+        }, heartbeatInterval, heartbeatInterval, TimeUnit.MILLISECONDS);
+    }
+
+    private void stopHeartbeat() {
+        ScheduledExecutorService scheduler = this.heartbeatScheduler;
+        if (scheduler != null && !scheduler.isShutdown()) {
+            scheduler.shutdownNow();
+        }
+        this.heartbeatScheduler = null;
+    }
+
+    private void sendHeartbeat(String message) {
+        PrintWriter w = this.output;
+        if (w != null) {
+            w.println(message);
+        }
     }
 
     // ==================== 回调通知（主线程） ====================
