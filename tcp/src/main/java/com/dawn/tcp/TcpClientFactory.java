@@ -2,9 +2,12 @@ package com.dawn.tcp;
 
 import android.os.Handler;
 import android.os.Looper;
+import android.util.Base64;
 import android.util.Log;
 
 import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
@@ -48,6 +51,7 @@ public class TcpClientFactory {
     private int maxReconnectCount = DEFAULT_MAX_RECONNECT_COUNT;
     private long heartbeatInterval = 0;
     private long heartbeatTimeout = 0;
+    private volatile File fileSaveDir;
 
     private volatile Socket socket;
     private volatile PrintWriter output;
@@ -60,6 +64,7 @@ public class TcpClientFactory {
     private volatile ExecutorService sendExecutor;
     private volatile ScheduledExecutorService heartbeatScheduler;
     private volatile long lastDataReceivedTime = 0;
+    private final TcpFileHelper.FileReceiveContext fileReceiveCtx = new TcpFileHelper.FileReceiveContext();
 
     public TcpClientFactory() {
     }
@@ -136,6 +141,17 @@ public class TcpClientFactory {
         }
         this.heartbeatInterval = intervalMs;
         this.heartbeatTimeout = timeoutMs;
+        return this;
+    }
+
+    /**
+     * 设置文件接收保存目录。未设置则不支持接收文件，收到文件传输消息会触发 onFileError。
+     *
+     * @param dir 保存目录
+     * @return this
+     */
+    public TcpClientFactory setFileSaveDir(File dir) {
+        this.fileSaveDir = dir;
         return this;
     }
 
@@ -234,6 +250,35 @@ public class TcpClientFactory {
     public boolean isConnected() {
         Socket s = this.socket;
         return s != null && s.isConnected() && !s.isClosed();
+    }
+
+    /**
+     * 发送文件（线程安全）。文件通过 Base64 编码分块传输，接收端自动还原。
+     * 传输过程对业务层透明，不会触发对端的 onReceiveData 回调。
+     *
+     * @param filePath 要发送的文件路径
+     * @return 是否提交发送成功
+     */
+    public boolean sendFile(String filePath) {
+        if (filePath == null) {
+            return false;
+        }
+        File file = new File(filePath);
+        if (!file.exists() || !file.isFile()) {
+            Log.e(TAG, "File not found: " + filePath);
+            return false;
+        }
+        PrintWriter writer = this.output;
+        ExecutorService exec = this.sendExecutor;
+        if (writer != null && exec != null && !exec.isShutdown() && isConnected()) {
+            try {
+                exec.execute(() -> doSendFile(writer, file));
+                return true;
+            } catch (RejectedExecutionException e) {
+                Log.w(TAG, "SendFile rejected, executor is shut down");
+            }
+        }
+        return false;
     }
 
     // ==================== 内部实现 ====================
@@ -381,7 +426,11 @@ public class TcpClientFactory {
                     if (HEARTBEAT_PING.equals(line)) {
                         sendHeartbeat(HEARTBEAT_PONG);
                     } else if (!HEARTBEAT_PONG.equals(line)) {
-                        notifyReceiveData(line);
+                        if (TcpFileHelper.isFileProtocol(line)) {
+                            handleFileProtocol(line);
+                        } else {
+                            notifyReceiveData(line);
+                        }
                     }
                     lineBuilder.setLength(0);
                 } else {
@@ -422,6 +471,93 @@ public class TcpClientFactory {
             ce.shutdownNow();
         }
         this.connectExecutor = null;
+    }
+
+    // ==================== 文件传输 ====================
+
+    private void doSendFile(PrintWriter writer, File file) {
+        String fileName = file.getName();
+        long fileSize = file.length();
+        try {
+            String md5 = TcpFileHelper.md5(file);
+            writer.println(TcpFileHelper.FILE_START + fileName + "##" + fileSize);
+            if (writer.checkError()) {
+                notifyError("Send file header failed: " + fileName);
+                return;
+            }
+            FileInputStream fis = new FileInputStream(file);
+            byte[] buffer = new byte[TcpFileHelper.CHUNK_SIZE];
+            int read;
+            while ((read = fis.read(buffer)) != -1) {
+                String base64 = Base64.encodeToString(buffer, 0, read, Base64.NO_WRAP);
+                writer.println(TcpFileHelper.FILE_DATA + base64);
+                if (writer.checkError()) {
+                    fis.close();
+                    notifyError("Send file data failed: " + fileName);
+                    return;
+                }
+            }
+            fis.close();
+            writer.println(TcpFileHelper.FILE_END + md5);
+            if (writer.checkError()) {
+                notifyError("Send file end failed: " + fileName);
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "Send file error: " + fileName, e);
+            notifyError("Send file error: " + e.getMessage());
+        }
+    }
+
+    private void handleFileProtocol(String line) {
+        if (line.startsWith(TcpFileHelper.FILE_START)) {
+            String payload = line.substring(TcpFileHelper.FILE_START.length());
+            String[] parts = payload.split("##", 2);
+            if (parts.length != 2) {
+                notifyFileError("unknown", "Invalid file start header");
+                return;
+            }
+            String fileName = parts[0];
+            long fileSize;
+            try {
+                fileSize = Long.parseLong(parts[1]);
+            } catch (NumberFormatException e) {
+                notifyFileError(fileName, "Invalid file size");
+                return;
+            }
+            File saveDir = this.fileSaveDir;
+            if (saveDir == null) {
+                notifyFileError(fileName, "File save directory not set, call setFileSaveDir() first");
+                return;
+            }
+            if (!fileReceiveCtx.begin(saveDir, fileName, fileSize)) {
+                notifyFileError(fileName, "Failed to initialize file receive");
+            }
+        } else if (line.startsWith(TcpFileHelper.FILE_DATA)) {
+            if (!fileReceiveCtx.isReceiving()) {
+                return;
+            }
+            String base64Data = line.substring(TcpFileHelper.FILE_DATA.length());
+            int progress = fileReceiveCtx.writeChunk(base64Data);
+            if (progress < 0) {
+                String fn = fileReceiveCtx.fileName;
+                fileReceiveCtx.reset();
+                notifyFileError(fn != null ? fn : "unknown", "Write chunk failed");
+            } else {
+                notifyFileProgress(fileReceiveCtx.fileName, progress);
+            }
+        } else if (line.startsWith(TcpFileHelper.FILE_END)) {
+            if (!fileReceiveCtx.isReceiving()) {
+                return;
+            }
+            String expectedMd5 = line.substring(TcpFileHelper.FILE_END.length());
+            String fileName = fileReceiveCtx.fileName;
+            String filePath = fileReceiveCtx.finish(expectedMd5);
+            if (filePath != null) {
+                notifyFileReceived(filePath, fileName);
+            } else {
+                notifyFileError(fileName != null ? fileName : "unknown", "File MD5 verification failed");
+            }
+        }
     }
 
     // ==================== 心跳机制 ====================
@@ -497,6 +633,27 @@ public class TcpClientFactory {
         TcpClientListener l = listener;
         if (l != null) {
             mainHandler.post(l::onStopped);
+        }
+    }
+
+    private void notifyFileProgress(String fileName, int progress) {
+        TcpClientListener l = listener;
+        if (l != null) {
+            mainHandler.post(() -> l.onFileProgress(fileName, progress));
+        }
+    }
+
+    private void notifyFileReceived(String filePath, String originalFileName) {
+        TcpClientListener l = listener;
+        if (l != null) {
+            mainHandler.post(() -> l.onFileReceived(filePath, originalFileName));
+        }
+    }
+
+    private void notifyFileError(String fileName, String errorMessage) {
+        TcpClientListener l = listener;
+        if (l != null) {
+            mainHandler.post(() -> l.onFileError(fileName, errorMessage));
         }
     }
 }
