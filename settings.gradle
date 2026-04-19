@@ -1,0 +1,3 @@
+rootProject.name = "lib-tcp"
+include ':app'
+include ':tcp'
