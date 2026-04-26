@@ -34,4 +34,28 @@ public interface TcpServerListener {
      * @param errorMessage 错误信息
      */
     default void onFileError(String clientId, String fileName, String errorMessage) {}
+
+    /**
+     * 大数据接收完成回调。
+     *
+     * @param clientId 发送方客户端ID
+     * @param data     接收到的完整字节数组
+     */
+    default void onReceiveLargeData(String clientId, byte[] data) {}
+
+    /**
+     * 大数据接收进度回调。
+     *
+     * @param clientId 发送方客户端ID
+     * @param progress 进度（0-100）
+     */
+    default void onLargeDataProgress(String clientId, int progress) {}
+
+    /**
+     * 大数据接收失败回调。
+     *
+     * @param clientId     发送方客户端ID
+     * @param errorMessage 错误信息
+     */
+    default void onLargeDataError(String clientId, String errorMessage) {}
 }

@@ -293,6 +293,41 @@ public class TcpServerFactory {
     }
 
     /**
+     * 向指定客户端发送大数据。数据通过 Base64 编码分块传输，接收端自动还原。
+     * 传输过程对业务层透明，不会触发对端的 onReceiveData 回调。
+     *
+     * @param clientId 目标客户端ID
+     * @param data     要发送的字节数据
+     * @return 是否提交发送成功
+     */
+    public boolean sendLargeData(String clientId, byte[] data) {
+        if (clientId == null || data == null || data.length == 0) return false;
+        ClientConnection conn = clientMap.get(clientId);
+        ExecutorService exec = this.clientExecutor;
+        if (conn != null && exec != null && !exec.isShutdown()) {
+            try {
+                exec.execute(() -> doSendLargeData(conn, data));
+                return true;
+            } catch (RejectedExecutionException e) {
+                Log.w(TAG, "SendLargeData rejected, executor is shut down");
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 向指定客户端发送大文本数据。
+     *
+     * @param clientId 目标客户端ID
+     * @param text     要发送的文本
+     * @return 是否提交发送成功
+     */
+    public boolean sendLargeData(String clientId, String text) {
+        if (text == null) return false;
+        return sendLargeData(clientId, text.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    /**
      * 获得当前连接的客户端数量
      */
     public int getClientCount() {
@@ -450,6 +485,8 @@ public class TcpServerFactory {
                         } else if (!HEARTBEAT_PONG.equals(line)) {
                             if (TcpFileHelper.isFileProtocol(line)) {
                                 handleFileProtocol(conn, line);
+                            } else if (TcpFileHelper.isLargeDataProtocol(line)) {
+                                handleLargeDataProtocol(conn, line);
                             } else {
                                 notifyReceiveData(conn.clientId, line);
                             }
@@ -563,6 +600,54 @@ public class TcpServerFactory {
         }
     }
 
+    // ==================== 大数据传输 ====================
+
+    private void doSendLargeData(ClientConnection conn, byte[] data) {
+        String md5 = TcpFileHelper.md5(data);
+        conn.send(TcpFileHelper.LARGE_START + data.length);
+        for (int i = 0; i < data.length; i += TcpFileHelper.CHUNK_SIZE) {
+            int end = Math.min(i + TcpFileHelper.CHUNK_SIZE, data.length);
+            String b64 = android.util.Base64.encodeToString(data, i, end - i, android.util.Base64.NO_WRAP);
+            conn.send(TcpFileHelper.LARGE_DATA + b64);
+        }
+        conn.send(TcpFileHelper.LARGE_END + md5);
+    }
+
+    private void handleLargeDataProtocol(ClientConnection conn, String line) {
+        if (line.startsWith(TcpFileHelper.LARGE_START)) {
+            String sizeStr = line.substring(TcpFileHelper.LARGE_START.length());
+            long dataSize;
+            try {
+                dataSize = Long.parseLong(sizeStr);
+            } catch (NumberFormatException e) {
+                notifyLargeDataError(conn.clientId, "Invalid large data size");
+                return;
+            }
+            if (!conn.largeDataReceiveCtx.begin(dataSize)) {
+                notifyLargeDataError(conn.clientId, "Failed to initialize large data receive");
+            }
+        } else if (line.startsWith(TcpFileHelper.LARGE_DATA)) {
+            if (!conn.largeDataReceiveCtx.isReceiving()) return;
+            String b64 = line.substring(TcpFileHelper.LARGE_DATA.length());
+            int progress = conn.largeDataReceiveCtx.writeChunk(b64);
+            if (progress < 0) {
+                conn.largeDataReceiveCtx.reset();
+                notifyLargeDataError(conn.clientId, "Write large data chunk failed");
+            } else {
+                notifyLargeDataProgress(conn.clientId, progress);
+            }
+        } else if (line.startsWith(TcpFileHelper.LARGE_END)) {
+            if (!conn.largeDataReceiveCtx.isReceiving()) return;
+            String expectedMd5 = line.substring(TcpFileHelper.LARGE_END.length());
+            byte[] data = conn.largeDataReceiveCtx.finish(expectedMd5);
+            if (data != null) {
+                notifyReceiveLargeData(conn.clientId, data);
+            } else {
+                notifyLargeDataError(conn.clientId, "Large data MD5 verification failed");
+            }
+        }
+    }
+
     // ==================== 心跳机制 ====================
 
     private void startServerHeartbeat() {
@@ -606,6 +691,7 @@ public class TcpServerFactory {
         private final Object sendLock = new Object();
         volatile long lastActivityTime;
         final TcpFileHelper.FileReceiveContext fileReceiveCtx = new TcpFileHelper.FileReceiveContext();
+        final TcpFileHelper.LargeDataReceiveContext largeDataReceiveCtx = new TcpFileHelper.LargeDataReceiveContext();
 
         ClientConnection(String clientId, Socket socket) {
             this.clientId = clientId;
@@ -716,6 +802,27 @@ public class TcpServerFactory {
         TcpServerListener l = listener;
         if (l != null) {
             mainHandler.post(() -> l.onFileError(clientId, fileName, errorMessage));
+        }
+    }
+
+    private void notifyReceiveLargeData(String clientId, byte[] data) {
+        TcpServerListener l = listener;
+        if (l != null) {
+            mainHandler.post(() -> l.onReceiveLargeData(clientId, data));
+        }
+    }
+
+    private void notifyLargeDataProgress(String clientId, int progress) {
+        TcpServerListener l = listener;
+        if (l != null) {
+            mainHandler.post(() -> l.onLargeDataProgress(clientId, progress));
+        }
+    }
+
+    private void notifyLargeDataError(String clientId, String errorMessage) {
+        TcpServerListener l = listener;
+        if (l != null) {
+            mainHandler.post(() -> l.onLargeDataError(clientId, errorMessage));
         }
     }
 }

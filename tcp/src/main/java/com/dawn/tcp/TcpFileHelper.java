@@ -3,6 +3,7 @@ package com.dawn.tcp;
 import android.util.Base64;
 import android.util.Log;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -35,6 +36,13 @@ class TcpFileHelper {
     /** 每次读取原始文件数据的大小（字节），Base64 后约 43KB，在 64KB 行限制内 */
     static final int CHUNK_SIZE = 32 * 1024;
 
+    /** 大数据传输开始标识 */
+    static final String LARGE_START = "##LARGE_START##";
+    /** 大数据数据块标识 */
+    static final String LARGE_DATA = "##LARGE_DATA##";
+    /** 大数据传输结束标识 */
+    static final String LARGE_END = "##LARGE_END##";
+
     private TcpFileHelper() {
     }
 
@@ -43,6 +51,30 @@ class TcpFileHelper {
      */
     static boolean isFileProtocol(String line) {
         return line.startsWith(FILE_START) || line.startsWith(FILE_DATA) || line.startsWith(FILE_END);
+    }
+
+    /**
+     * 判断一行消息是否为大数据传输协议消息
+     */
+    static boolean isLargeDataProtocol(String line) {
+        return line.startsWith(LARGE_START) || line.startsWith(LARGE_DATA) || line.startsWith(LARGE_END);
+    }
+
+    /**
+     * 计算字节数组的 MD5 值
+     *
+     * @param data 字节数组
+     * @return MD5 十六进制字符串，失败返回空字符串
+     */
+    static String md5(byte[] data) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("MD5");
+            digest.update(data);
+            return bytesToHex(digest.digest());
+        } catch (NoSuchAlgorithmException e) {
+            Log.e(TAG, "MD5 calculation failed", e);
+            return "";
+        }
     }
 
     /**
@@ -212,6 +244,99 @@ class TcpFileHelper {
 
         boolean isReceiving() {
             return outputStream != null;
+        }
+    }
+
+    // ==================== 大数据接收状态机 ====================
+
+    /**
+     * 大数据接收上下文，每个连接维护一个实例。
+     * 大数据接收后以字节数组形式回调给业务层，不写文件。
+     */
+    static class LargeDataReceiveContext {
+        private long dataSize;
+        private long receivedSize;
+        private ByteArrayOutputStream buffer;
+        private MessageDigest digest;
+
+        /**
+         * 开始接收大数据
+         *
+         * @param dataSize 数据总大小（字节）
+         * @return 是否初始化成功
+         */
+        boolean begin(long dataSize) {
+            reset();
+            this.dataSize = dataSize;
+            this.receivedSize = 0;
+            this.buffer = new ByteArrayOutputStream();
+            try {
+                this.digest = MessageDigest.getInstance("MD5");
+                return true;
+            } catch (NoSuchAlgorithmException e) {
+                Log.e(TAG, "LargeData begin failed", e);
+                reset();
+                return false;
+            }
+        }
+
+        /**
+         * 写入一个数据块
+         *
+         * @param base64Data Base64 编码的数据块
+         * @return 当前接收进度（0-100），失败返回 -1
+         */
+        int writeChunk(String base64Data) {
+            if (buffer == null) return -1;
+            try {
+                byte[] data = Base64.decode(base64Data, Base64.NO_WRAP);
+                buffer.write(data);
+                digest.update(data);
+                receivedSize += data.length;
+                if (dataSize > 0) {
+                    return (int) (receivedSize * 100 / dataSize);
+                }
+                return 0;
+            } catch (Exception e) {
+                Log.e(TAG, "LargeData writeChunk failed", e);
+                return -1;
+            }
+        }
+
+        /**
+         * 完成大数据接收，校验 MD5
+         *
+         * @param expectedMd5 期望的 MD5 值
+         * @return 接收到的字节数组，校验失败返回 null
+         */
+        byte[] finish(String expectedMd5) {
+            if (buffer == null) {
+                reset();
+                return null;
+            }
+            String actualMd5 = bytesToHex(digest.digest());
+            if (!actualMd5.equalsIgnoreCase(expectedMd5)) {
+                Log.e(TAG, "LargeData MD5 mismatch: expected=" + expectedMd5 + ", actual=" + actualMd5);
+                reset();
+                return null;
+            }
+            byte[] result = buffer.toByteArray();
+            reset();
+            return result;
+        }
+
+        /**
+         * 重置状态
+         */
+        void reset() {
+            buffer = null;
+            dataSize = 0;
+            receivedSize = 0;
+            digest = null;
+        }
+
+        boolean isReceiving() {
+            return buffer != null;
         }
     }
 }
